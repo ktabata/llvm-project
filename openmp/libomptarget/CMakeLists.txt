@@ -111,5 +111,8 @@ add_subdirectory(plugins-nextgen)
 add_subdirectory(DeviceRTL)
 add_subdirectory(tools)
 
+add_subdirectory(libm)
+add_subdirectory(hostexec)
+
 # Add tests.
 add_subdirectory(test)

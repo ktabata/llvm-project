@@ -15,6 +15,7 @@
 
 #include "omptarget.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/DynamicLibrary.h"
 
@@ -24,6 +25,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 // Forward declarations.
 struct DeviceTy;
@@ -36,10 +38,14 @@ struct RTLInfoTy {
   typedef int32_t(is_valid_binary_info_ty)(void *, void *);
   typedef int32_t(is_data_exchangable_ty)(int32_t, int32_t);
   typedef int32_t(number_of_devices_ty)();
+  typedef bool(has_apu_device_ty)();
+  typedef bool(has_gfx90a_device_ty)();
   typedef int32_t(init_device_ty)(int32_t);
   typedef int32_t(deinit_device_ty)(int32_t);
+  typedef int32_t(number_of_team_procs_ty)(int32_t);
   typedef __tgt_target_table *(load_binary_ty)(int32_t, void *);
   typedef void *(data_alloc_ty)(int32_t, int64_t, void *, int32_t);
+
   typedef int32_t(data_submit_ty)(int32_t, void *, void *, int64_t);
   typedef int32_t(data_submit_async_ty)(int32_t, void *, void *, int64_t,
                                         __tgt_async_info *);
@@ -50,6 +56,8 @@ struct RTLInfoTy {
   typedef int32_t(data_exchange_async_ty)(int32_t, void *, int32_t, void *,
                                           int64_t, __tgt_async_info *);
   typedef int32_t(data_delete_ty)(int32_t, void *, int32_t);
+  typedef int32_t(launch_kernel_sync_ty)(int32_t, void *, void **, ptrdiff_t *,
+                                         const KernelArgsTy *);
   typedef int32_t(launch_kernel_ty)(int32_t, void *, void **, ptrdiff_t *,
                                     const KernelArgsTy *, __tgt_async_info *);
   typedef int64_t(init_requires_ty)(int64_t);
@@ -64,12 +72,17 @@ struct RTLInfoTy {
   typedef int32_t(wait_event_ty)(int32_t, void *, __tgt_async_info *);
   typedef int32_t(sync_event_ty)(int32_t, void *);
   typedef int32_t(destroy_event_ty)(int32_t, void *);
+  typedef int(set_coarse_grain_mem_region_ty)(int32_t, void *, int64_t);
+  typedef int32_t(query_coarse_grain_mem_region_ty)(int32_t, void *, int64_t);
+  typedef int32_t(enable_access_to_all_agents_ty)(void *, int32_t);
   typedef int32_t(release_async_info_ty)(int32_t, __tgt_async_info *);
   typedef int32_t(init_async_info_ty)(int32_t, __tgt_async_info **);
   typedef int64_t(init_device_into_ty)(int64_t, __tgt_device_info *,
                                        const char **);
   typedef int32_t(data_lock_ty)(int32_t, void *, int64_t, void **);
   typedef int32_t(data_unlock_ty)(int32_t, void *);
+  typedef int32_t(data_notify_mapped_ty)(int32_t, void *, int64_t);
+  typedef int32_t(data_notify_unmapped_ty)(int32_t, void *);
 
   int32_t Idx = -1;             // RTL index, index is the number of devices
                                 // of other RTLs that were registered before,
@@ -90,8 +103,11 @@ struct RTLInfoTy {
   is_valid_binary_info_ty *is_valid_binary_info = nullptr;
   is_data_exchangable_ty *is_data_exchangable = nullptr;
   number_of_devices_ty *number_of_devices = nullptr;
+  has_apu_device_ty *has_apu_device = nullptr;
+  has_gfx90a_device_ty *has_gfx90a_device = nullptr;
   init_device_ty *init_device = nullptr;
   deinit_device_ty *deinit_device = nullptr;
+  number_of_team_procs_ty *number_of_team_procs = nullptr;
   load_binary_ty *load_binary = nullptr;
   data_alloc_ty *data_alloc = nullptr;
   data_submit_ty *data_submit = nullptr;
@@ -101,6 +117,7 @@ struct RTLInfoTy {
   data_exchange_ty *data_exchange = nullptr;
   data_exchange_async_ty *data_exchange_async = nullptr;
   data_delete_ty *data_delete = nullptr;
+  launch_kernel_sync_ty *launch_kernel_sync = nullptr;
   launch_kernel_ty *launch_kernel = nullptr;
   init_requires_ty *init_requires = nullptr;
   synchronize_ty *synchronize = nullptr;
@@ -120,6 +137,11 @@ struct RTLInfoTy {
   release_async_info_ty *release_async_info = nullptr;
   data_lock_ty *data_lock = nullptr;
   data_unlock_ty *data_unlock = nullptr;
+  set_coarse_grain_mem_region_ty *set_coarse_grain_mem_region = nullptr;
+  query_coarse_grain_mem_region_ty *query_coarse_grain_mem_region = nullptr;
+  enable_access_to_all_agents_ty *enable_access_to_all_agents = nullptr;
+  data_notify_mapped_ty *data_notify_mapped = nullptr;
+  data_notify_unmapped_ty *data_notify_unmapped = nullptr;
 
   // Are there images associated with this RTL.
   bool IsUsed = false;
@@ -143,6 +165,22 @@ struct RTLsTy {
 
   int64_t RequiresFlags = OMP_REQ_UNDEFINED;
 
+  // Set by OMPX_DISABLE_MAPS environment variable.
+  // When active (default value), maps are ignored by the runtime
+  bool NoUSMMapChecks = true;
+
+  bool IsAPUDevice = false;
+  bool IsGfx90aDevice = false;
+
+  // Set by OMPX_DISABLE_USM_MAPS environment variable.
+  // If set, fine graned memory is used for maps instead of coarse grained.
+  bool EnableFineGrainedMemory = false;
+
+  // Set by OMPX_APU_MAPS environment variable.
+  // If set, maps cause no copy operations. USM is used instead. Allocated
+  // memory remains coarse grained.
+  bool DisableAllocationsForMapsOnApus = false;
+
   explicit RTLsTy() = default;
 
   // Register the clauses of the requires directive.
@@ -162,6 +200,14 @@ struct RTLsTy {
 
   // not thread-safe, called from global constructor (i.e. once)
   void loadRTLs();
+
+  std::vector<std::string> archsSupportingManagedMemory = {
+      "gfx908", "gfx90a", "gfx940", "gfx941", "gfx942",
+      "sm_35",  "sm_50",  "sm_60",  "sm_70",  "sm_61"};
+  // Return whether the current system supports omp_get_target_memory_space
+  bool SystemSupportManagedMemory();
+
+  void disableAPUMapsForUSM(int64_t RequiresFlags);
 
 private:
   static bool attemptLoadRTL(const std::string &RTLName, RTLInfoTy &RTL);
